@@ -33,8 +33,6 @@ static void vfio_user_recycle(VFIOUserProxy *proxy, VFIOUserMsg *msg);
 static void vfio_user_recv(void *opaque);
 static void vfio_user_send(void *opaque);
 
-static void vfio_user_request(void *opaque);
-
 static inline void vfio_user_set_error(VFIOUserHdr *hdr, uint32_t err)
 {
     hdr->flags |= VFIO_USER_ERROR;
@@ -116,7 +114,8 @@ static void vfio_user_recycle(VFIOUserProxy *proxy, VFIOUserMsg *msg)
     }
 
     /* free msg buffer if no one is waiting to consume the reply */
-    if (msg->type == VFIO_MSG_NOWAIT || msg->type == VFIO_MSG_ASYNC) {
+    if (msg->type == VFIO_MSG_NOWAIT || msg->type == VFIO_MSG_ASYNC ||
+        msg->type == VFIO_MSG_DISCARD) {
         g_free(msg->hdr);
         if (msg->fds != NULL) {
             g_free(msg->fds);
@@ -141,11 +140,228 @@ VFIOUserFDs *vfio_user_getfds(int numfds)
 }
 
 /*
+ * Stop waiting for the reply to @msg.  If that reply is being read right
+ * now, finish reading it into a private buffer, as the waiter owns msg->hdr.
+ */
+static void vfio_user_abandon(VFIOUserProxy *proxy, VFIOUserMsg *msg)
+{
+    VFIOUserMsg *discard;
+
+    if (proxy->part_recv == msg) {
+        discard = vfio_user_getmsg(proxy,
+                                   g_memdup2(msg->hdr, msg->hdr->size), NULL);
+        discard->type = VFIO_MSG_DISCARD;
+        proxy->part_recv = discard;
+    } else if (msg->pending) {
+        QTAILQ_REMOVE(&proxy->pending, msg, next);
+    } else {
+        QTAILQ_REMOVE(&proxy->outgoing, msg, next);
+        proxy->num_outgoing--;
+    }
+}
+
+/*
+ * Socket is read unless a request is waiting to be handled in the main loop,
+ * and written while there are outgoing messages.
+ */
+static void vfio_user_set_fd_handlers(VFIOUserProxy *proxy)
+{
+    bool reading = proxy->req_deferred == NULL;
+    bool writing = !QTAILQ_EMPTY(&proxy->outgoing);
+
+    qio_channel_set_aio_fd_handler(proxy->ioc,
+                                   proxy->ctx, reading ? vfio_user_recv : NULL,
+                                   proxy->ctx, writing ? vfio_user_send : NULL,
+                                   proxy);
+}
+
+/*
+ * Free a request that won't be handled.
+ */
+static void vfio_user_drop_request(VFIOUserMsg *msg)
+{
+    if (msg->fds != NULL) {
+        vfio_user_putfds(msg);
+    }
+    g_free(msg->hdr);
+    msg->hdr = NULL;
+}
+
+/*
+ * Fail a request without handling it.
+ */
+static void vfio_user_reject(VFIOUserProxy *proxy, VFIOUserMsg *msg, int err)
+{
+    if (msg->hdr->flags & VFIO_USER_NO_REPLY) {
+        vfio_user_drop_request(msg);
+        return;
+    }
+    if (msg->fds != NULL) {
+        vfio_user_putfds(msg);
+    }
+    vfio_user_send_error(proxy, msg->hdr, err);
+}
+
+/*
+ * Release a request message entry once its buffer has been disposed of.
+ */
+static void vfio_user_put_request(VFIOUserProxy *proxy, VFIOUserMsg *msg)
+{
+    /* vfio_user_disconnect() may have freed the free list meanwhile */
+    if (proxy->state == VFIO_PROXY_CLOSING) {
+        qemu_cond_destroy(&msg->cv);
+        g_free(msg);
+    } else {
+        vfio_user_recycle(proxy, msg);
+    }
+}
+
+/*
+ * Complete the deferred request, see vfio_user_dispatch(): handle it if
+ * @handle, otherwise fail it, for contexts where device DMA can't be
+ * handled safely.  Called with the BQL held.
+ */
+static void vfio_user_finish_deferred(VFIOUserProxy *proxy, bool handle)
+{
+    bool (*request)(void *opaque, VFIOUserMsg *msg) = proxy->request;
+    VFIOUserMsg *msg = proxy->req_deferred;
+    void *req_arg = proxy->req_arg;
+
+    assert(bql_locked());
+
+    proxy->req_running = true;
+    qemu_mutex_unlock(&proxy->lock);
+
+    if (!handle) {
+        trace_vfio_user_fail_deferred(msg->hdr->command);
+        vfio_user_reject(proxy, msg, EBUSY);
+    } else if (request == NULL || !request(req_arg, msg)) {
+        vfio_user_reject(proxy, msg, ENODEV);
+    }
+
+    qemu_mutex_lock(&proxy->lock);
+    proxy->req_running = false;
+    proxy->req_deferred = NULL;
+    vfio_user_put_request(proxy, msg);
+    if (proxy->state == VFIO_PROXY_CONNECTED) {
+        vfio_user_set_fd_handlers(proxy);
+    }
+}
+
+/*
+ * Dispose of a message that will never be completely received.
+ */
+static void vfio_user_drop_part_recv(VFIOUserProxy *proxy, int err)
+{
+    VFIOUserMsg *msg = proxy->part_recv;
+
+    if (msg == NULL) {
+        return;
+    }
+    proxy->part_recv = NULL;
+    proxy->recv_left = 0;
+
+    switch (msg->type) {
+    case VFIO_MSG_REQ:
+        vfio_user_drop_request(msg);
+        vfio_user_put_request(proxy, msg);
+        break;
+    case VFIO_MSG_DISCARD:
+        /* received FDs are ours to close, the buffer is freed on recycle */
+        if (msg->fds != NULL) {
+            vfio_user_putfds(msg);
+        }
+        vfio_user_recycle(proxy, msg);
+        break;
+    case VFIO_MSG_WAIT:
+        /* the waiter owns the buffer and recycles the entry */
+        vfio_user_set_error(msg->hdr, err);
+        msg->complete = true;
+        qemu_cond_signal(&msg->cv);
+        break;
+    default:
+        if (proxy->last_nowait == msg) {
+            proxy->last_nowait = NULL;
+        }
+        vfio_user_recycle(proxy, msg);
+    }
+}
+
+/*
  * Functions only called by iothread
  */
 
 /*
+ * Handle a request from the server.
+ *
+ * Requests are handled in the order received, before any later message is
+ * read, so that e.g. a DMA write is visible by the time a subsequent reply
+ * wakes up its waiter.
+ *
+ * The handler runs without the BQL: a vCPU holding it may be waiting for a
+ * reply that the server only sends once this request completes.  The proxy
+ * lock is dropped as well, since the handler sends its own reply.
+ *
+ * The bus-specific handler has the form:
+ *    request(opaque, msg)
+ * where 'opaque' was specified in vfio_user_set_handler
+ * and 'msg' is the inbound message.
+ *
+ * The handler is responsible for disposing of the message buffer,
+ * usually by re-using it when calling vfio_send_reply or vfio_send_error,
+ * both of which free their message buffer when the reply is sent.
+ *
+ * If the handler uses a new buffer, it needs to free the old one.
+ *
+ * If the handler needs the BQL, e.g. for DMA to MMIO, it returns false
+ * without disposing of the message.  No further messages are read until
+ * that request completes, which happens either in the main loop, or, since
+ * the main loop can't run then, in a thread that holds the BQL while waiting
+ * for a reply from the server; see vfio_user_wait_reply().
+ */
+static void vfio_user_dispatch(VFIOUserProxy *proxy, VFIOUserMsg *msg)
+{
+    bool (*request)(void *opaque, VFIOUserMsg *msg) = proxy->request;
+    void *req_arg = proxy->req_arg;
+    bool handled = true;
+
+    trace_vfio_user_recv_request(msg->hdr->command);
+
+    proxy->req_active = true;
+    qemu_mutex_unlock(&proxy->lock);
+
+    if (request != NULL) {
+        handled = request(req_arg, msg);
+    } else {
+        vfio_user_reject(proxy, msg, ENODEV);
+    }
+
+    qemu_mutex_lock(&proxy->lock);
+    proxy->req_active = false;
+    qemu_cond_broadcast(&proxy->req_cv);
+
+    if (!handled) {
+        if (proxy->state == VFIO_PROXY_CONNECTED) {
+            trace_vfio_user_defer_request(msg->hdr->command);
+            proxy->req_deferred = msg;
+            vfio_user_set_fd_handlers(proxy);
+            qemu_bh_schedule(proxy->req_bh);
+            if (proxy->bql_waiter != NULL) {
+                qemu_cond_signal(&proxy->bql_waiter->cv);
+            }
+            return;
+        }
+        vfio_user_drop_request(msg);
+    }
+
+    vfio_user_put_request(proxy, msg);
+}
+
+/*
  * Process a received message.
+ *
+ * Handling a request drops the proxy lock, so callers must re-check the
+ * proxy state afterwards.
  */
 static void vfio_user_process(VFIOUserProxy *proxy, VFIOUserMsg *msg)
 {
@@ -154,9 +370,14 @@ static void vfio_user_process(VFIOUserProxy *proxy, VFIOUserMsg *msg)
      * Replies signal a waiter, if none just check for errors
      * and free the message buffer.
      *
-     * Requests get queued for the BH.
+     * Requests are handled right away.
      */
-    if ((msg->hdr->flags & VFIO_USER_TYPE) == VFIO_USER_REPLY) {
+    if (msg->type == VFIO_MSG_DISCARD) {
+        if (msg->fds != NULL) {
+            vfio_user_putfds(msg);
+        }
+        vfio_user_recycle(proxy, msg);
+    } else if ((msg->hdr->flags & VFIO_USER_TYPE) == VFIO_USER_REPLY) {
         msg->complete = true;
         if (msg->type == VFIO_MSG_WAIT) {
             qemu_cond_signal(&msg->cv);
@@ -174,8 +395,7 @@ static void vfio_user_process(VFIOUserProxy *proxy, VFIOUserMsg *msg)
             vfio_user_recycle(proxy, msg);
         }
     } else {
-        QTAILQ_INSERT_TAIL(&proxy->incoming, msg, next);
-        qemu_bh_schedule(proxy->req_bh);
+        vfio_user_dispatch(proxy, msg);
     }
 }
 
@@ -277,7 +497,7 @@ static int vfio_user_recv_hdr(VFIOUserProxy *proxy, Error **errp,
  * Receive and process one incoming message.
  *
  * For replies, find matching outgoing request and wake any waiters.
- * For requests, queue in incoming list and run request BH.
+ * For requests, run the request handler.
  */
 static int vfio_user_recv_one(VFIOUserProxy *proxy, Error **errp)
 {
@@ -304,7 +524,7 @@ static int vfio_user_recv_one(VFIOUserProxy *proxy, Error **errp)
         if (ret <= 0) {
             goto fatal;
         }
-        /* else fall into reading another msg */
+        return 0;
     }
 
     ret = vfio_user_recv_hdr(proxy, errp, &hdr, &fdp, &numfds, &isreply);
@@ -326,14 +546,25 @@ static int vfio_user_recv_one(VFIOUserProxy *proxy, Error **errp)
             }
         }
         if (msg == NULL) {
-            error_setg(errp, "unexpected reply");
-            goto err;
-        }
-        QTAILQ_REMOVE(&proxy->pending, msg, next);
+            /*
+             * Most likely a late reply to a request that timed out.  Read
+             * and drop it to stay in sync with the stream.
+             */
+            if (hdr.size > proxy->max_xfer_size + sizeof(VFIOUserRegionRW)) {
+                error_setg(errp, "unexpected reply too large");
+                ret = -1;
+                goto fatal;
+            }
+            trace_vfio_user_recv_discard(hdr.id, hdr.command);
+            msg = vfio_user_getmsg(proxy, g_malloc0(hdr.size), NULL);
+            msg->type = VFIO_MSG_DISCARD;
+        } else {
+            QTAILQ_REMOVE(&proxy->pending, msg, next);
 
-        if (hdr.size > msg->rsize) {
-            error_setg(errp, "reply larger than recv buffer");
-            goto err;
+            if (hdr.size > msg->rsize) {
+                error_setg(errp, "reply larger than recv buffer");
+                goto err;
+            }
         }
     } else {
         void *buf;
@@ -352,8 +583,9 @@ static int vfio_user_recv_one(VFIOUserProxy *proxy, Error **errp)
     data = (char *)msg->hdr + sizeof(hdr);
 
     if (numfds != 0) {
-        if (msg->type == VFIO_MSG_REQ) {
+        if (msg->type == VFIO_MSG_REQ || msg->type == VFIO_MSG_DISCARD) {
             msg->fds = vfio_user_getfds(numfds);
+            msg->fds->recv_fds = numfds;
         } else {
             if (msg->fds == NULL || msg->fds->recv_fds < numfds) {
                 error_setg(errp, "unexpected FDs in reply");
@@ -402,6 +634,7 @@ static int vfio_user_recv_one(VFIOUserProxy *proxy, Error **errp)
 fatal:
     vfio_user_shutdown(proxy);
     proxy->state = VFIO_PROXY_ERROR;
+    vfio_user_drop_part_recv(proxy, EIO);
 
     /* set error if server side closed */
     if (ret == 0) {
@@ -413,7 +646,7 @@ err:
         close(fdp[i]);
     }
     if (msg != NULL) {
-        if (msg->type == VFIO_MSG_REQ) {
+        if (msg->type == VFIO_MSG_REQ || msg->type == VFIO_MSG_DISCARD) {
             /*
              * Clean up the request message on failure. Change type back to
              * NOWAIT to free.
@@ -435,19 +668,18 @@ err:
 static void vfio_user_recv(void *opaque)
 {
     VFIOUserProxy *proxy = opaque;
+    Error *local_err = NULL;
 
     QEMU_LOCK_GUARD(&proxy->lock);
 
-    if (proxy->state == VFIO_PROXY_CONNECTED) {
-        Error *local_err = NULL;
+    while (proxy->state == VFIO_PROXY_CONNECTED &&
+           proxy->req_deferred == NULL &&
+           vfio_user_recv_one(proxy, &local_err) == 0) {
+        ;
+    }
 
-        while (vfio_user_recv_one(proxy, &local_err) == 0) {
-            ;
-        }
-
-        if (local_err != NULL) {
-            error_report_err(local_err);
-        }
+    if (local_err != NULL) {
+        error_report_err(local_err);
     }
 }
 
@@ -503,8 +735,7 @@ static void vfio_user_send(void *opaque)
                 return;
             }
         }
-        qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx,
-                                       vfio_user_recv, NULL, NULL, proxy);
+        vfio_user_set_fd_handlers(proxy);
 
         /* queue empty - send any pending multi write msgs */
         if (proxy->wr_multi != NULL) {
@@ -529,48 +760,17 @@ static void vfio_user_close_cb(void *opaque)
  */
 
 /*
- * Process incoming requests.
- *
- * The bus-specific callback has the form:
- *    request(opaque, msg)
- * where 'opaque' was specified in vfio_user_set_handler
- * and 'msg' is the inbound message.
- *
- * The callback is responsible for disposing of the message buffer,
- * usually by re-using it when calling vfio_send_reply or vfio_send_error,
- * both of which free their message buffer when the reply is sent.
- *
- * If the callback uses a new buffer, it needs to free the old one.
+ * Handle a request that needs the BQL, see vfio_user_dispatch().
  */
-static void vfio_user_request(void *opaque)
+static void vfio_user_request_bh(void *opaque)
 {
     VFIOUserProxy *proxy = opaque;
-    VFIOUserMsgQ new, free;
-    VFIOUserMsg *msg, *m1;
 
-    /* reap all incoming */
-    QTAILQ_INIT(&new);
-    WITH_QEMU_LOCK_GUARD(&proxy->lock) {
-        QTAILQ_FOREACH_SAFE(msg, &proxy->incoming, next, m1) {
-            QTAILQ_REMOVE(&proxy->incoming, msg, next);
-            QTAILQ_INSERT_TAIL(&new, msg, next);
-        }
-    }
+    QEMU_LOCK_GUARD(&proxy->lock);
 
-    /* process list */
-    QTAILQ_INIT(&free);
-    QTAILQ_FOREACH_SAFE(msg, &new, next, m1) {
-        QTAILQ_REMOVE(&new, msg, next);
-        trace_vfio_user_recv_request(msg->hdr->command);
-        proxy->request(proxy->req_arg, msg);
-        QTAILQ_INSERT_HEAD(&free, msg, next);
-    }
-
-    /* free list */
-    WITH_QEMU_LOCK_GUARD(&proxy->lock) {
-        QTAILQ_FOREACH_SAFE(msg, &free, next, m1) {
-            vfio_user_recycle(proxy, msg);
-        }
+    /* a BQL holder waiting for a reply may have handled it already */
+    if (proxy->req_deferred != NULL && !proxy->req_running) {
+        vfio_user_finish_deferred(proxy, true);
     }
 }
 
@@ -608,6 +808,11 @@ static bool vfio_user_send_queued(VFIOUserProxy *proxy, VFIOUserMsg *msg,
 {
     int ret;
 
+    if (proxy->state != VFIO_PROXY_CONNECTED) {
+        error_setg_errno(errp, ECONNRESET, "proxy is not connected");
+        return false;
+    }
+
     /* older coalesced writes go first */
     if (proxy->wr_multi != NULL &&
         ((msg->hdr->flags & VFIO_USER_TYPE) == VFIO_USER_REQUEST)) {
@@ -635,9 +840,7 @@ static bool vfio_user_send_queued(VFIOUserProxy *proxy, VFIOUserMsg *msg,
     if (ret == QIO_CHANNEL_ERR_BLOCK) {
         QTAILQ_INSERT_HEAD(&proxy->outgoing, msg, next);
         proxy->num_outgoing = 1;
-        qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx,
-                                       vfio_user_recv, proxy->ctx,
-                                       vfio_user_send, proxy);
+        vfio_user_set_fd_handlers(proxy);
         return true;
     }
     if (ret == -1) {
@@ -695,13 +898,45 @@ bool vfio_user_send_nowait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
 }
 
 /*
- * Returns false if we did not successfully receive a reply message, in which
- * case @errp will be populated.
+ * Wait for the reply to @msg, with the proxy lock held.  Returns false on
+ * timeout.
  *
- * In either case, the caller must free @hdr and @fds if needed.
+ * The server may send a request that needs the BQL before the reply, and
+ * no message is read until that request completes, see vfio_user_dispatch().
+ * The main loop can't handle it while we hold the BQL, so we complete it
+ * here: handle it if @handle_deferred, or fail it where handling device DMA
+ * isn't safe, e.g. during a memory transaction commit.
  */
-bool vfio_user_send_wait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
-                         VFIOUserFDs *fds, int rsize, Error **errp)
+static bool vfio_user_wait_reply(VFIOUserProxy *proxy, VFIOUserMsg *msg,
+                                 bool handle_deferred)
+{
+    bool bql = bql_locked();
+    bool ok = true;
+
+    if (bql) {
+        proxy->bql_waiter = msg;
+    }
+    while (!msg->complete) {
+        if (bql && proxy->req_deferred != NULL) {
+            vfio_user_finish_deferred(proxy, handle_deferred);
+            continue;
+        }
+        if (!qemu_cond_timedwait(&msg->cv, &proxy->lock, proxy->wait_time)) {
+            vfio_user_abandon(proxy, msg);
+            ok = false;
+            break;
+        }
+    }
+    if (bql) {
+        proxy->bql_waiter = NULL;
+    }
+    return ok;
+}
+
+static bool vfio_user_send_wait_common(VFIOUserProxy *proxy,
+                                       VFIOUserHdr *hdr, VFIOUserFDs *fds,
+                                       int rsize, bool handle_deferred,
+                                       Error **errp)
 {
     VFIOUserMsg *msg;
     bool ok = false;
@@ -711,7 +946,17 @@ bool vfio_user_send_wait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
         return false;
     }
 
-    qemu_mutex_lock(&proxy->lock);
+    QEMU_LOCK_GUARD(&proxy->lock);
+
+    /*
+     * The server won't reply before it has our reply to the request being
+     * handled, and we can't read anything else meanwhile.
+     */
+    if (proxy->req_running) {
+        error_setg_errno(errp, EDEADLK,
+                         "can't wait for a reply while handling a request");
+        return false;
+    }
 
     msg = vfio_user_getmsg(proxy, hdr, fds);
     msg->id = hdr->id;
@@ -720,27 +965,40 @@ bool vfio_user_send_wait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
 
     ok = vfio_user_send_queued(proxy, msg, errp);
 
-    if (ok) {
-        while (!msg->complete) {
-            if (!qemu_cond_timedwait(&msg->cv, &proxy->lock,
-                                     proxy->wait_time)) {
-                VFIOUserMsgQ *list;
-
-                list = msg->pending ? &proxy->pending : &proxy->outgoing;
-                QTAILQ_REMOVE(list, msg, next);
-                error_setg_errno(errp, ETIMEDOUT,
-                                 "timed out waiting for reply");
-                ok = false;
-                break;
-            }
-        }
+    if (ok && !vfio_user_wait_reply(proxy, msg, handle_deferred)) {
+        error_setg_errno(errp, ETIMEDOUT, "timed out waiting for reply");
+        ok = false;
     }
 
     vfio_user_recycle(proxy, msg);
 
-    qemu_mutex_unlock(&proxy->lock);
-
     return ok;
+}
+
+/*
+ * Returns false if we did not successfully receive a reply message, in which
+ * case @errp will be populated.
+ *
+ * In either case, the caller must free @hdr and @fds if needed.
+ *
+ * Requests from the server that need the BQL are handled while waiting if the
+ * caller holds the BQL, see vfio_user_wait_reply().
+ */
+bool vfio_user_send_wait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
+                         VFIOUserFDs *fds, int rsize, Error **errp)
+{
+    return vfio_user_send_wait_common(proxy, hdr, fds, rsize, true, errp);
+}
+
+/*
+ * As vfio_user_send_wait(), for DMA map and unmap requests, which may be sent
+ * from memory listeners and IOMMU notifiers, where handling device DMA isn't
+ * safe.  Requests from the server that need the BQL are failed instead.
+ */
+bool vfio_user_send_wait_dma(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
+                             VFIOUserFDs *fds, int rsize, Error **errp)
+{
+    return vfio_user_send_wait_common(proxy, hdr, fds, rsize, false, errp);
 }
 
 /*
@@ -788,22 +1046,23 @@ void vfio_user_wait_reqs(VFIOUserProxy *proxy)
      */
     qemu_mutex_lock(&proxy->lock);
     if (proxy->last_nowait != NULL) {
-        /*
-         * Change type to WAIT to wait for reply
-         */
         msg = proxy->last_nowait;
-        msg->type = VFIO_MSG_WAIT;
         proxy->last_nowait = NULL;
-        while (!msg->complete) {
-            if (!qemu_cond_timedwait(&msg->cv, &proxy->lock,
-                                     proxy->wait_time)) {
-                VFIOUserMsgQ *list;
 
-                list = msg->pending ? &proxy->pending : &proxy->outgoing;
-                QTAILQ_REMOVE(list, msg, next);
-                error_printf("vfio_wait_reqs - timed out\n");
-                break;
-            }
+        /* see vfio_user_send_wait_common(); the reply frees msg */
+        if (proxy->req_running) {
+            error_printf("vfio_user_wait_reqs - can't wait while handling "
+                         "a request: command %x\n", msg->hdr->command);
+            goto out;
+        }
+
+        /*
+         * Change type to WAIT to wait for reply.  This is a memory
+         * transaction commit, see vfio_user_wait_reply().
+         */
+        msg->type = VFIO_MSG_WAIT;
+        if (!vfio_user_wait_reply(proxy, msg, false)) {
+            error_printf("vfio_wait_reqs - timed out\n");
         }
 
         if (msg->hdr->flags & VFIO_USER_ERROR) {
@@ -819,6 +1078,7 @@ void vfio_user_wait_reqs(VFIOUserProxy *proxy)
         vfio_user_recycle(proxy, msg);
     }
 
+out:
     qemu_mutex_unlock(&proxy->lock);
 }
 
@@ -931,16 +1191,16 @@ VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp)
 
     qemu_mutex_init(&proxy->lock);
     qemu_cond_init(&proxy->close_cv);
+    qemu_cond_init(&proxy->req_cv);
 
     if (vfio_user_iothread == NULL) {
         vfio_user_iothread = iothread_create("vfio-user", errp);
     }
 
     proxy->ctx = iothread_get_aio_context(vfio_user_iothread);
-    proxy->req_bh = qemu_bh_new(vfio_user_request, proxy);
+    proxy->req_bh = qemu_bh_new(vfio_user_request_bh, proxy);
 
     QTAILQ_INIT(&proxy->outgoing);
-    QTAILQ_INIT(&proxy->incoming);
     QTAILQ_INIT(&proxy->free);
     QTAILQ_INIT(&proxy->pending);
     QLIST_INSERT_HEAD(&vfio_user_sockets, proxy, next);
@@ -953,15 +1213,33 @@ fail:
 }
 
 void vfio_user_set_handler(VFIODevice *vbasedev,
-                           void (*handler)(void *opaque, VFIOUserMsg *msg),
+                           bool (*handler)(void *opaque, VFIOUserMsg *msg),
                            void *req_arg)
 {
     VFIOUserProxy *proxy = vbasedev->proxy;
 
+    QEMU_LOCK_GUARD(&proxy->lock);
+
     proxy->request = handler;
     proxy->req_arg = req_arg;
-    qio_channel_set_aio_fd_handler(proxy->ioc, proxy->ctx,
-                                   vfio_user_recv, NULL, NULL, proxy);
+    vfio_user_set_fd_handlers(proxy);
+}
+
+/*
+ * Stop handling requests from the server, and wait for the one currently
+ * being handled, if any.  Requests received afterwards are rejected.
+ *
+ * Must not be called from the proxy's iothread.
+ */
+void vfio_user_clear_handler(VFIOUserProxy *proxy)
+{
+    QEMU_LOCK_GUARD(&proxy->lock);
+
+    proxy->request = NULL;
+    proxy->req_arg = NULL;
+    while (proxy->req_active) {
+        qemu_cond_wait(&proxy->req_cv, &proxy->lock);
+    }
 }
 
 void vfio_user_disconnect(VFIOUserProxy *proxy)
@@ -979,18 +1257,20 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
     }
     object_unref(OBJECT(proxy->ioc));
     proxy->ioc = NULL;
-    qemu_bh_delete(proxy->req_bh);
-    proxy->req_bh = NULL;
 
     proxy->state = VFIO_PROXY_CLOSING;
+    vfio_user_drop_part_recv(proxy, ECONNRESET);
+    qemu_bh_delete(proxy->req_bh);
+    proxy->req_bh = NULL;
+    if (proxy->req_deferred != NULL) {
+        vfio_user_drop_request(proxy->req_deferred);
+        qemu_cond_destroy(&proxy->req_deferred->cv);
+        g_free(proxy->req_deferred);
+        proxy->req_deferred = NULL;
+    }
     QTAILQ_FOREACH_SAFE(r1, &proxy->outgoing, next, r2) {
         qemu_cond_destroy(&r1->cv);
         QTAILQ_REMOVE(&proxy->outgoing, r1, next);
-        g_free(r1);
-    }
-    QTAILQ_FOREACH_SAFE(r1, &proxy->incoming, next, r2) {
-        qemu_cond_destroy(&r1->cv);
-        QTAILQ_REMOVE(&proxy->incoming, r1, next);
         g_free(r1);
     }
     QTAILQ_FOREACH_SAFE(r1, &proxy->pending, next, r2) {
@@ -1019,6 +1299,7 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
     /* we now hold the only ref to proxy */
     qemu_mutex_unlock(&proxy->lock);
     qemu_cond_destroy(&proxy->close_cv);
+    qemu_cond_destroy(&proxy->req_cv);
     qemu_mutex_destroy(&proxy->lock);
 
     QLIST_REMOVE(proxy, next);

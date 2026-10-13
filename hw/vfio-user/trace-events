@@ -18,6 +18,9 @@ vfio_user_region_rw(uint32_t region, uint64_t off, uint32_t count) " region %d o
 vfio_user_recv_hdr(const char *name, uint16_t id, uint16_t cmd, uint32_t size, uint32_t flags) " (%s) id 0x%x cmd 0x%x size 0x%x flags 0x%x"
 vfio_user_recv_read(uint16_t id, int read) " id 0x%x read 0x%x"
 vfio_user_recv_request(uint16_t cmd) " command 0x%x"
+vfio_user_defer_request(uint16_t cmd) " command 0x%x"
+vfio_user_fail_deferred(uint16_t cmd) " command 0x%x"
+vfio_user_recv_discard(uint16_t id, uint16_t cmd) " id 0x%x command 0x%x"
 vfio_user_send_write(uint16_t id, int wrote) " id 0x%x wrote 0x%x"
 vfio_user_version(uint16_t major, uint16_t minor, const char *caps) " major %d minor %d caps: %s"
 vfio_user_wrmulti(const char *s, uint64_t wr_cnt) " %s count 0x%"PRIx64

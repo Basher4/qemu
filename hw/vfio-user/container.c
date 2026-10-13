@@ -65,8 +65,8 @@ static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
             ret = -EFAULT;
         }
     } else {
-        if (!vfio_user_send_wait(container->proxy, &msgp->hdr, NULL,
-                                 0, &local_err)) {
+        if (!vfio_user_send_wait_dma(container->proxy, &msgp->hdr, NULL,
+                                     0, &local_err)) {
                 error_report_err(local_err);
                 ret = -EFAULT;
         }
@@ -138,8 +138,8 @@ static int vfio_user_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
 
         fds = fd != -1 ? &local_fds : NULL;
 
-        if (!vfio_user_send_wait(container->proxy, &msgp->hdr, fds,
-                                 0, &local_err)) {
+        if (!vfio_user_send_wait_dma(container->proxy, &msgp->hdr, fds,
+                                     0, &local_err)) {
                 error_report_err(local_err);
                 ret = -EFAULT;
         }

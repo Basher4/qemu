@@ -10,6 +10,7 @@
 #include <sys/ioctl.h>
 #include "qapi-visit-sockets.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 
 #include "hw/core/qdev-properties.h"
 #include "hw/vfio/pci.h"
@@ -84,7 +85,79 @@ static void vfio_user_msix_teardown(VFIOPCIDevice *vdev)
     vdev->msix->pba_region = NULL;
 }
 
-static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
+/*
+ * Requests are first handled without the BQL (see vfio_user_dispatch()),
+ * which only allows accessing guest RAM: dispatching to MMIO, e.g. for
+ * peer-to-peer DMA, needs the BQL.  Returns false if the access has to be
+ * retried with the BQL held.
+ *
+ * Accesses that don't resolve to RAM, including unmapped addresses and
+ * IOMMU faults, are thus retried, and fail, with the BQL held.  A retried
+ * request is redone in full, so a write that spans RAM and MMIO writes the
+ * RAM part twice, with the same data.
+ *
+ * Requests that need the BQL may be failed with EBUSY if they arrive while
+ * QEMU waits for the reply to a DMA map or unmap request, as handling them
+ * in that context isn't safe.  See vfio_user_wait_reply().
+ */
+static bool vfio_user_dma_rw(PCIDevice *pdev, dma_addr_t addr, void *buf,
+                             dma_addr_t len, bool is_write, MemTxResult *res)
+{
+    AddressSpace *as = pci_get_address_space(pdev);
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    uint8_t *data = buf;
+    ram_addr_t offset;
+    MemoryRegion *mr;
+    hwaddr l, xlat;
+    void *p;
+
+    if (bql_locked()) {
+        *res = is_write ? pci_dma_write(pdev, addr, buf, len) :
+                          pci_dma_read(pdev, addr, buf, len);
+        return true;
+    }
+
+    /* same barrier as dma_memory_rw() */
+    smp_mb();
+
+    while (len > 0) {
+        l = len;
+        if (is_write) {
+            /*
+             * For anything but RAM, this returns a bounce buffer that
+             * address_space_unmap() would write back via MMIO.
+             */
+            p = address_space_map(as, addr, &l, true, attrs);
+            if (p == NULL) {
+                return false;
+            }
+            if (memory_region_from_host(p, &offset) == NULL) {
+                address_space_unmap(as, p, l, false, 0);
+                return false;
+            }
+            qemu_ram_move(p, data, l);
+            address_space_unmap(as, p, l, true, l);
+        } else {
+            RCU_READ_LOCK_GUARD();
+
+            mr = address_space_translate(as, addr, &xlat, &l, false, attrs);
+            if (!memory_access_is_direct(mr, false, attrs)) {
+                return false;
+            }
+            p = qemu_map_ram_ptr(mr->ram_block, xlat);
+            qemu_ram_move(data, p, l);
+        }
+
+        addr += l;
+        data += l;
+        len -= l;
+    }
+
+    *res = MEMTX_OK;
+    return true;
+}
+
+static bool vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
 {
     PCIDevice *pdev = PCI_DEVICE(vdev);
     VFIOUserProxy *proxy = vdev->vbasedev.proxy;
@@ -94,30 +167,34 @@ static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
 
     if (msg->hdr.size < sizeof(*msg)) {
         vfio_user_send_error(proxy, &msg->hdr, EINVAL);
-        return;
+        return true;
     }
     if (msg->count > proxy->max_xfer_size) {
         vfio_user_send_error(proxy, &msg->hdr, E2BIG);
-        return;
+        return true;
     }
 
     /* switch to our own message buffer */
     size = msg->count + sizeof(VFIOUserDMARW);
     res = g_malloc0(size);
     memcpy(res, msg, sizeof(*res));
+
+    if (!vfio_user_dma_rw(pdev, res->offset, &res->data, res->count, false,
+                          &r)) {
+        g_free(res);
+        return false;
+    }
     g_free(msg);
 
-    r = pci_dma_read(pdev, res->offset, &res->data, res->count);
-
     /*
-     * pci_dma_read() doesn't support reporting short reads via the reply's
+     * vfio_user_dma_rw() doesn't support reporting short reads via the reply's
      * count parameter; in this case, we'll reply with an error instead.
      */
     switch (r) {
     case MEMTX_OK:
         if (res->hdr.flags & VFIO_USER_NO_REPLY) {
             g_free(res);
-            return;
+            break;
         }
         vfio_user_send_reply(proxy, &res->hdr, size);
         break;
@@ -134,9 +211,11 @@ static void vfio_user_dma_read(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
         error_printf("vfio_user_dma_read unknown error %d\n", r);
         vfio_user_send_error(vdev->vbasedev.proxy, &res->hdr, EINVAL);
     }
+
+    return true;
 }
 
-static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
+static bool vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
 {
     PCIDevice *pdev = PCI_DEVICE(vdev);
     VFIOUserProxy *proxy = vdev->vbasedev.proxy;
@@ -145,29 +224,32 @@ static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
 
     if (msg->hdr.size < sizeof(*msg)) {
         vfio_user_send_error(proxy, &msg->hdr, EINVAL);
-        return;
+        return true;
     }
     /* make sure transfer count isn't larger than the message data */
     if (msg->count > msg->hdr.size - sizeof(*msg)) {
         vfio_user_send_error(proxy, &msg->hdr, E2BIG);
-        return;
+        return true;
     }
 
-    r = pci_dma_write(pdev, msg->offset, &msg->data, msg->count);
+    if (!vfio_user_dma_rw(pdev, msg->offset, &msg->data, msg->count, true,
+                          &r)) {
+        return false;
+    }
 
     res = g_malloc0(sizeof(*res));
     memcpy(res, msg, sizeof(*res));
     g_free(msg);
 
     /*
-     * pci_dma_write() doesn't support reporting short writes via the reply's
-     * count parameter; in this case, we'll reply with an error instead.
+     * vfio_user_dma_rw() doesn't support reporting short writes via the
+     * reply's count parameter; in this case, we'll reply with an error instead.
      */
     switch (r) {
     case MEMTX_OK:
         if (res->hdr.flags & VFIO_USER_NO_REPLY) {
             g_free(res);
-            return;
+            break;
         }
 
         vfio_user_send_reply(proxy, &res->hdr, sizeof(*res));
@@ -185,14 +267,17 @@ static void vfio_user_dma_write(VFIOPCIDevice *vdev, VFIOUserDMARW *msg)
         error_printf("vfio_user_dma_write unknown error %d\n", r);
         vfio_user_send_error(vdev->vbasedev.proxy, &res->hdr, EINVAL);
     }
+
+    return true;
 }
 
 /*
  * Incoming request message callback.
  *
- * Runs off main loop, so BQL held.
+ * Runs in the proxy's iothread without the BQL, or with the BQL held if it
+ * returned false there.
  */
-static void vfio_user_pci_process_req(void *opaque, VFIOUserMsg *msg)
+static bool vfio_user_pci_process_req(void *opaque, VFIOUserMsg *msg)
 {
     VFIOPCIDevice *vdev = opaque;
     VFIOUserHdr *hdr = msg->hdr;
@@ -201,20 +286,19 @@ static void vfio_user_pci_process_req(void *opaque, VFIOUserMsg *msg)
     if (msg->fds != NULL) {
         vfio_user_send_error(vdev->vbasedev.proxy, hdr, EINVAL);
         vfio_user_putfds(msg);
-        return;
+        return true;
     }
 
     switch (hdr->command) {
     case VFIO_USER_DMA_READ:
-        vfio_user_dma_read(vdev, (VFIOUserDMARW *)hdr);
-        break;
+        return vfio_user_dma_read(vdev, (VFIOUserDMARW *)hdr);
     case VFIO_USER_DMA_WRITE:
-        vfio_user_dma_write(vdev, (VFIOUserDMARW *)hdr);
-        break;
+        return vfio_user_dma_write(vdev, (VFIOUserDMARW *)hdr);
     default:
         error_printf("vfio_user_pci_process_req unknown cmd %d\n",
                      hdr->command);
         vfio_user_send_error(vdev->vbasedev.proxy, hdr, ENOSYS);
+        return true;
     }
 }
 
@@ -353,7 +437,19 @@ out_teardown:
     vfio_pci_bars_exit(vdev);
 error:
     error_prepend(errp, VFIO_MSG_PREFIX, vdev->vbasedev.name);
+    vfio_user_clear_handler(proxy);
     vfio_pci_put_device(vdev);
+}
+
+static void vfio_user_pci_exit(PCIDevice *pdev)
+{
+    PCIDeviceClass *parent_pdc =
+        PCI_DEVICE_CLASS(object_class_by_name(TYPE_VFIO_PCI_DEVICE));
+
+    parent_pdc->exit(pdev);
+
+    /* DMA requests use the bus master address space, destroyed after exit */
+    vfio_user_clear_handler(VFIO_PCI_DEVICE(pdev)->vbasedev.proxy);
 }
 
 static void vfio_user_pci_init(Object *obj)
@@ -473,6 +569,7 @@ static void vfio_user_pci_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "VFIO over socket PCI device assignment";
     pdc->realize = vfio_user_pci_realize;
+    pdc->exit = vfio_user_pci_exit;
 }
 
 static const TypeInfo vfio_user_pci_info = {

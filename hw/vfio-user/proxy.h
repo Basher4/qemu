@@ -30,6 +30,11 @@ enum msg_type {
     VFIO_MSG_WAIT,
     VFIO_MSG_NOWAIT,
     VFIO_MSG_REQ,
+    /*
+     * Not a protocol message type: receive state for a message, e.g. a late
+     * reply, that is read only to stay in sync with the stream and dropped.
+     */
+    VFIO_MSG_DISCARD,
 };
 
 typedef struct VFIOUserMsg {
@@ -58,7 +63,7 @@ typedef struct VFIOUserProxy {
     QLIST_ENTRY(VFIOUserProxy) next;
     char *sockname;
     struct QIOChannel *ioc;
-    void (*request)(void *opaque, VFIOUserMsg *msg);
+    bool (*request)(void *opaque, VFIOUserMsg *msg);
     void *req_arg;
     uint64_t max_xfer_size;
     uint64_t max_send_fds;
@@ -69,6 +74,7 @@ typedef struct VFIOUserProxy {
     int flags;
     uint32_t wait_time;
     QemuCond close_cv;
+    QemuCond req_cv;
     AioContext *ctx;
     QEMUBH *req_bh;
     bool async_ops;
@@ -80,8 +86,11 @@ typedef struct VFIOUserProxy {
     QemuMutex lock;
     VFIOUserMsgQ free;
     VFIOUserMsgQ pending;
-    VFIOUserMsgQ incoming;
     VFIOUserMsgQ outgoing;
+    bool req_active;
+    bool req_running;
+    VFIOUserMsg *req_deferred;
+    VFIOUserMsg *bql_waiter;
     VFIOUserMsg *last_nowait;
     VFIOUserMsg *part_recv;
     size_t recv_left;
@@ -105,8 +114,9 @@ typedef struct VFIODevice VFIODevice;
 VFIOUserProxy *vfio_user_connect_dev(SocketAddress *addr, Error **errp);
 void vfio_user_disconnect(VFIOUserProxy *proxy);
 void vfio_user_set_handler(VFIODevice *vbasedev,
-                           void (*handler)(void *opaque, VFIOUserMsg *msg),
+                           bool (*handler)(void *opaque, VFIOUserMsg *msg),
                            void *reqarg);
+void vfio_user_clear_handler(VFIOUserProxy *proxy);
 bool vfio_user_validate_version(VFIOUserProxy *proxy, Error **errp);
 
 VFIOUserFDs *vfio_user_getfds(int numfds);
@@ -119,6 +129,8 @@ void vfio_user_request_msg(VFIOUserHdr *hdr, uint16_t cmd,
 void vfio_user_wait_reqs(VFIOUserProxy *proxy);
 bool vfio_user_send_wait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
                          VFIOUserFDs *fds, int rsize, Error **errp);
+bool vfio_user_send_wait_dma(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
+                             VFIOUserFDs *fds, int rsize, Error **errp);
 bool vfio_user_send_nowait(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
                            VFIOUserFDs *fds, int rsize, Error **errp);
 bool vfio_user_send_async(VFIOUserProxy *proxy, VFIOUserHdr *hdr,
